@@ -17,7 +17,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            backends: vec![BackendSpec::gopls()],
+            backends: vec![BackendSpec::gopls(), BackendSpec::clangd()],
         }
     }
 }
@@ -52,13 +52,31 @@ impl BackendSpec {
     }
 
     pub fn gopls() -> Self {
-        let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect();
         Self {
             // Both VS Code and Neovim spellings of the Go language ids.
             language_ids: strings(&["go", "go.mod", "go.work", "gomod", "gowork", "gotmpl"]),
             extensions: strings(&["go"]),
             file_names: strings(&["go.mod", "go.work"]),
-            ..Self::new("go", Launch::command("gopls"))
+            ..Self::new("gopls", Launch::command("gopls"))
+        }
+    }
+
+    pub fn clangd() -> Self {
+        Self {
+            language_ids: strings(&[
+                "c",
+                "cpp",
+                "objective-c",
+                "objective-cpp",
+                "objc",
+                "objcpp",
+                "cuda",
+            ]),
+            extensions: strings(&[
+                "c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++", "inl", "ipp",
+                "tpp", "m", "mm", "cu", "cuh",
+            ]),
+            ..Self::new("clangd", Launch::command("clangd"))
         }
     }
 
@@ -112,4 +130,8 @@ pub type Connector = Arc<dyn Fn() -> io::Result<Connection> + Send + Sync>;
 pub struct Connection {
     pub reader: Box<dyn AsyncRead + Send + Unpin>,
     pub writer: Box<dyn AsyncWrite + Send + Unpin>,
+}
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
 }

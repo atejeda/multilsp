@@ -14,7 +14,8 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::{Backend, BackendEvent};
-use crate::config::{BackendSpec, Config};
+use crate::capabilities::{self, TokenRemap};
+use crate::config::{BackendSpec, Config, Launch};
 use crate::jsonrpc::{
     self, Id, Message, MessageReader, Notification, Request, Response, ResponseError, error_codes,
 };
@@ -115,6 +116,7 @@ enum GroupKind {
 struct Group {
     client_id: Id,
     kind: GroupKind,
+    method: String,
     pending: usize,
     results: Vec<(usize, Result<Value, ResponseError>)>,
 }
@@ -137,6 +139,12 @@ struct Gateway {
     server_requests: HashMap<i64, (usize, Id)>,
     /// Open documents and the backend they were routed to.
     documents: HashMap<String, usize>,
+    /// Each backend's `initialize` capabilities, `Null` until it has initialized.
+    capabilities: Vec<Value>,
+    /// Each backend's dynamic registrations, id to method.
+    registrations: Vec<HashMap<String, String>>,
+    /// Translation of each backend's semantic tokens into the advertised legend.
+    token_remaps: Vec<Option<TokenRemap>>,
     shutdown_deadline: Option<Instant>,
 }
 
@@ -148,7 +156,6 @@ impl Gateway {
     ) -> Self {
         Self {
             slots: specs.iter().map(|_| None).collect(),
-            specs,
             client,
             backend_events,
             phase: Phase::Uninitialized,
@@ -159,6 +166,10 @@ impl Gateway {
             client_requests: HashMap::new(),
             server_requests: HashMap::new(),
             documents: HashMap::new(),
+            capabilities: specs.iter().map(|_| Value::Null).collect(),
+            registrations: specs.iter().map(|_| HashMap::new()).collect(),
+            token_remaps: specs.iter().map(|_| None).collect(),
+            specs,
             shutdown_deadline: None,
         }
     }
@@ -214,8 +225,10 @@ impl Gateway {
             // Backends exit when this process disappears; their parent is us, not the editor.
             params.insert("processId".into(), json!(std::process::id()));
         }
+        capabilities::initialize_params(&mut params);
 
         let mut failures = Vec::new();
+        let mut warnings = Vec::new();
         for index in 0..self.specs.len() {
             let spec = &self.specs[index];
             match Backend::start(spec, index, self.backend_events.clone()) {
@@ -224,9 +237,17 @@ impl Gateway {
                     self.slots[index] = Some(backend);
                 }
                 Err(e) => {
-                    warn!(backend = %spec.name, "failed to start: {e}");
                     failures.push(format!("{}: {e}", spec.name));
-                    self.slots[index] = None;
+                    // A default backend that is not installed is expected, not worth a popup.
+                    let not_installed = e.kind() == std::io::ErrorKind::NotFound
+                        && matches!(&spec.launch, Launch::Command { program, .. }
+                            if program.components().count() == 1);
+                    if not_installed {
+                        info!(backend = %spec.name, "not available: {e}");
+                    } else {
+                        warn!(backend = %spec.name, "failed to start: {e}");
+                        warnings.push(format!("multilsp: {}: {e}", spec.name));
+                    }
                 }
             }
         }
@@ -247,8 +268,8 @@ impl Gateway {
             );
             return;
         }
-        for failure in failures {
-            self.show_message(MESSAGE_TYPE_WARNING, format!("multilsp: {failure}"));
+        for warning in warnings {
+            self.show_message(MESSAGE_TYPE_WARNING, warning);
         }
         self.phase = Phase::Initializing;
         self.dispatch(
@@ -284,14 +305,41 @@ impl Gateway {
                     let error = ResponseError::new(error_codes::INTERNAL_ERROR, message);
                     return self.reply(Some(request.id), Err(error));
                 }
+                // The backend lacks this feature; answer for it instead of letting it error.
+                Some(index) if !self.supports(index, &request.method) => {
+                    return self.reply(Some(request.id), Ok(Value::Null));
+                }
                 Some(index) => vec![index],
             },
-            None => self.running_indices(),
+            None => {
+                let running = self.running_indices();
+                if running.is_empty() {
+                    let error = ResponseError::new(
+                        error_codes::INTERNAL_ERROR,
+                        "no language server is running",
+                    );
+                    return self.reply(Some(request.id), Err(error));
+                }
+                let command = (request.method == "workspace/executeCommand")
+                    .then(|| request.params.as_ref()?.get("command")?.as_str())
+                    .flatten();
+                let owner = command.and_then(|command| {
+                    running
+                        .iter()
+                        .copied()
+                        .find(|&i| capabilities::has_command(&self.capabilities[i], command))
+                });
+                match owner {
+                    Some(index) => vec![index],
+                    None => running
+                        .into_iter()
+                        .filter(|&i| self.supports(i, &request.method))
+                        .collect(),
+                }
+            }
         };
         if targets.is_empty() {
-            let error =
-                ResponseError::new(error_codes::INTERNAL_ERROR, "no language server is running");
-            return self.reply(Some(request.id), Err(error));
+            return self.reply(Some(request.id), Ok(Value::Null));
         }
         self.dispatch(
             request.id,
@@ -410,6 +458,7 @@ impl Gateway {
                 }
             }
             BackendEvent::Message(Message::Request(request)) => {
+                self.track_registrations(index, &request);
                 let id = self.next_id();
                 self.server_requests.insert(id, (index, request.id));
                 self.send_client(Message::Request(Request {
@@ -425,6 +474,34 @@ impl Gateway {
                 }
             }
             BackendEvent::Closed => self.backend_closed(index),
+        }
+    }
+
+    /// Records dynamic capability registrations as they pass through to the client.
+    fn track_registrations(&mut self, index: usize, request: &Request) {
+        let (key, register) = match request.method.as_str() {
+            "client/registerCapability" => ("registrations", true),
+            // Sic: the protocol spells it this way.
+            "client/unregisterCapability" => ("unregisterations", false),
+            _ => return,
+        };
+        let entries = request
+            .params
+            .as_ref()
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_array);
+        for entry in entries.into_iter().flatten() {
+            let (Some(id), Some(method)) = (
+                entry.get("id").and_then(Value::as_str),
+                entry.get("method").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if register {
+                self.registrations[index].insert(id.to_string(), method.to_string());
+            } else {
+                self.registrations[index].remove(id);
+            }
         }
     }
 
@@ -481,6 +558,7 @@ impl Gateway {
             }
         }
         self.server_requests.retain(|_, (i, _)| *i != index);
+        self.registrations[index].clear();
     }
 
     fn on_shutdown_timeout(&mut self) {
@@ -542,6 +620,7 @@ impl Gateway {
             Group {
                 client_id,
                 kind,
+                method: method.to_string(),
                 pending: targets.len(),
                 results: Vec::new(),
             },
@@ -566,7 +645,15 @@ impl Gateway {
         }
         match group.kind {
             GroupKind::Forward => {
-                let result = merge_results(group.results.into_iter().map(|(_, r)| r).collect());
+                let results = group.results.into_iter().map(|(index, mut result)| {
+                    if let (Ok(value), Some(remap)) = (&mut result, &self.token_remaps[index])
+                        && group.method.starts_with("textDocument/semanticTokens/")
+                    {
+                        remap.apply(value);
+                    }
+                    result
+                });
+                let result = merge_results(results.collect());
                 self.reply(Some(group.client_id), result);
             }
             GroupKind::Shutdown => self.reply(Some(group.client_id), Ok(Value::Null)),
@@ -580,16 +667,17 @@ impl Gateway {
         mut results: Vec<(usize, Result<Value, ResponseError>)>,
     ) {
         results.sort_by_key(|(index, _)| *index);
-        let mut capabilities = Vec::new();
+        let mut initialized = false;
         let mut first_error = None;
         for (index, result) in results {
             match result {
-                Ok(value) => capabilities.push(
-                    value
+                Ok(value) => {
+                    initialized = true;
+                    self.capabilities[index] = value
                         .get("capabilities")
                         .cloned()
-                        .unwrap_or_else(|| json!({})),
-                ),
+                        .unwrap_or_else(|| json!({}));
+                }
                 Err(e) => {
                     let name = self.specs[index].name.clone();
                     warn!(backend = %name, "initialize failed: {}", e.message);
@@ -608,7 +696,7 @@ impl Gateway {
                 }
             }
         }
-        if capabilities.is_empty() {
+        if !initialized {
             self.phase = Phase::Uninitialized;
             let error = first_error.unwrap_or_else(|| {
                 ResponseError::new(
@@ -619,8 +707,10 @@ impl Gateway {
             return self.reply(Some(client_id), Err(error));
         }
         self.phase = Phase::Running;
+        let (merged, token_remaps) = capabilities::merge(&self.capabilities);
+        self.token_remaps = token_remaps;
         let result = json!({
-            "capabilities": merge_capabilities(capabilities),
+            "capabilities": merged,
             "serverInfo": {"name": "multilsp", "version": env!("CARGO_PKG_VERSION")},
         });
         self.reply(Some(client_id), Ok(result));
@@ -635,6 +725,11 @@ impl Gateway {
 
     fn running(&self, index: usize) -> Option<&Backend> {
         self.slots[index].as_ref()
+    }
+
+    fn supports(&self, index: usize, method: &str) -> bool {
+        let registered = self.registrations[index].values().map(String::as_str);
+        capabilities::supports(&self.capabilities[index], registered, method)
     }
 
     fn running_indices(&self) -> Vec<usize> {
@@ -697,20 +792,6 @@ fn merge_results(results: Vec<Result<Value, ResponseError>>) -> Result<Value, Re
     }
 }
 
-/// Union of the backends' top-level capabilities, earlier backends winning on conflicts.
-/// Per-feature reconciliation (spec FR-007) replaces this once several backends run together.
-fn merge_capabilities(all: Vec<Value>) -> Value {
-    let mut merged = serde_json::Map::new();
-    for capabilities in all {
-        if let Value::Object(capabilities) = capabilities {
-            for (key, value) in capabilities {
-                merged.entry(key).or_insert(value);
-            }
-        }
-    }
-    Value::Object(merged)
-}
-
 async fn read_client<R: AsyncRead + Unpin>(reader: R, events: mpsc::UnboundedSender<ClientEvent>) {
     let mut reader = MessageReader::new(reader);
     loop {
@@ -768,18 +849,6 @@ mod tests {
         assert_eq!(
             merge_results(vec![Ok(Value::Null), Ok(Value::Null)]),
             Ok(Value::Null)
-        );
-    }
-
-    #[test]
-    fn merges_capabilities_first_wins() {
-        let merged = merge_capabilities(vec![
-            json!({"hoverProvider": true, "textDocumentSync": 2}),
-            json!({"hoverProvider": false, "definitionProvider": true}),
-        ]);
-        assert_eq!(
-            merged,
-            json!({"hoverProvider": true, "textDocumentSync": 2, "definitionProvider": true})
         );
     }
 }

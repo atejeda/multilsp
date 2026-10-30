@@ -14,6 +14,7 @@
 //! ```
 
 mod backend;
+mod capabilities;
 pub mod config;
 mod gateway;
 pub mod jsonrpc;

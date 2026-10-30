@@ -51,10 +51,23 @@ async fn run_fake(name: String, stream: DuplexStream) {
     while let Ok(Some(Ok(message))) = reader.read().await {
         let reply = match message {
             Message::Request(request) => match request.method.as_str() {
-                "initialize" => Some(ok(
-                    request.id,
-                    json!({"capabilities": {"hoverProvider": true}}),
-                )),
+                "initialize" => {
+                    let legend = match name.as_str() {
+                        "alpha" => {
+                            json!({"tokenTypes": ["a1", "shared"], "tokenModifiers": ["m1"]})
+                        }
+                        _ => {
+                            json!({"tokenTypes": ["shared", "b1"], "tokenModifiers": ["m2", "m1"]})
+                        }
+                    };
+                    let capabilities = json!({
+                        "hoverProvider": true,
+                        "workspaceSymbolProvider": true,
+                        "executeCommandProvider": {"commands": [format!("{name}.run")]},
+                        "semanticTokensProvider": {"legend": legend, "full": true},
+                    });
+                    Some(ok(request.id, json!({ "capabilities": capabilities })))
+                }
                 "textDocument/hover" => {
                     let uri = request.params.unwrap()["textDocument"]["uri"]
                         .as_str()
@@ -66,6 +79,13 @@ async fn run_fake(name: String, stream: DuplexStream) {
                     ))
                 }
                 "workspace/symbol" => Some(ok(request.id, json!([{"name": name}]))),
+                "workspace/executeCommand" => Some(ok(request.id, json!({"ran": name}))),
+                // Type 1 with modifier bit 0, in this backend's own legend.
+                "textDocument/semanticTokens/full" => {
+                    Some(ok(request.id, json!({"data": [0, 0, 1, 1, 1]})))
+                }
+                // Not advertised; only served after `fake/register`.
+                "textDocument/definition" => Some(ok(request.id, json!({"backend": name}))),
                 "fake/slow" => {
                     slow = Some(request.id);
                     None
@@ -99,15 +119,33 @@ async fn run_fake(name: String, stream: DuplexStream) {
                         None
                     }
                 },
+                "fake/register" => {
+                    let registration = Message::Request(Request {
+                        id: Id::String(format!("{name}-register")),
+                        method: "client/registerCapability".into(),
+                        params: Some(json!({"registrations": [
+                            {"id": "r1", "method": "textDocument/definition"}
+                        ]})),
+                    });
+                    if write_message(&mut writer, registration).await.is_err() {
+                        return;
+                    }
+                    Some(Message::notification("fake/registered", None))
+                }
                 "exit" => return,
                 _ => None,
             },
-            Message::Response(response) => Some(Message::notification(
-                "fake/configured",
-                Some(
-                    json!({"backend": name, "id": response.id, "result": response.result.unwrap()}),
-                ),
-            )),
+            Message::Response(response)
+                if response.id == Some(Id::String(format!("{name}-config"))) =>
+            {
+                Some(Message::notification(
+                    "fake/configured",
+                    Some(
+                        json!({"backend": name, "id": response.id, "result": response.result.unwrap()}),
+                    ),
+                ))
+            }
+            Message::Response(_) => None,
         };
         if let Some(reply) = reply
             && write_message(&mut writer, reply).await.is_err()
@@ -320,4 +358,71 @@ async fn ends_when_client_disconnects() {
     s.initialize().await;
     drop(s.client);
     assert_eq!(s.server.await.unwrap(), Outcome::ClientClosed);
+}
+
+#[tokio::test]
+async fn reconciles_capabilities_across_backends() {
+    let mut s = start(vec![fake("alpha", "a"), fake("beta", "b")]);
+    let capabilities = s.initialize().await["capabilities"].clone();
+    assert_eq!(
+        capabilities["executeCommandProvider"]["commands"],
+        json!(["alpha.run", "beta.run"])
+    );
+    assert_eq!(
+        capabilities["semanticTokensProvider"]["legend"],
+        json!({"tokenTypes": ["a1", "shared", "b1"], "tokenModifiers": ["m1", "m2"]})
+    );
+
+    // Commands go to the backend that owns them.
+    let id = s
+        .client
+        .request("workspace/executeCommand", json!({"command": "beta.run"}))
+        .await;
+    assert_eq!(
+        s.client.response(&id).await.result,
+        Ok(json!({"ran": "beta"}))
+    );
+
+    // Token types and modifiers are translated into the merged legend.
+    for (uri, expected) in [
+        ("file:///w/x.a", [0, 0, 1, 1, 1]),
+        ("file:///w/y.b", [0, 0, 1, 2, 2]),
+    ] {
+        let params = json!({"textDocument": {"uri": uri}});
+        let id = s
+            .client
+            .request("textDocument/semanticTokens/full", params)
+            .await;
+        let result = s.client.response(&id).await.result.unwrap();
+        assert_eq!(result["data"], json!(expected), "{uri}");
+    }
+    assert_eq!(s.finish().await, Outcome::Exited);
+}
+
+#[tokio::test]
+async fn gates_requests_on_backend_capabilities() {
+    let mut s = start(vec![fake("alpha", "a")]);
+    s.initialize().await;
+    let definition =
+        json!({"textDocument": {"uri": "file:///w/x.a"}, "position": {"line": 0, "character": 0}});
+
+    // Not advertised: answered by the gateway instead of reaching the backend.
+    let id = s
+        .client
+        .request("textDocument/definition", definition.clone())
+        .await;
+    assert_eq!(s.client.response(&id).await.result, Ok(Value::Null));
+
+    // Registered dynamically: forwarded.
+    s.client.notify("fake/register", json!({})).await;
+    s.client.notification("fake/registered").await;
+    let id = s
+        .client
+        .request("textDocument/definition", definition)
+        .await;
+    assert_eq!(
+        s.client.response(&id).await.result,
+        Ok(json!({"backend": "alpha"}))
+    );
+    assert_eq!(s.finish().await, Outcome::Exited);
 }

@@ -26,7 +26,7 @@ struct ServeArgs {
     /// Speak LSP over stdin and stdout (currently the only transport).
     #[arg(long, required = true)]
     stdio: bool,
-    /// Use another executable for a backend, e.g. `--backend go=/opt/bin/gopls`.
+    /// Use another executable for a backend, e.g. `--backend clangd=/usr/bin/clangd-18`.
     #[arg(long = "backend", value_name = "NAME=PATH", value_parser = parse_backend)]
     backends: Vec<(String, PathBuf)>,
 }
