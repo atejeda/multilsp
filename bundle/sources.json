@@ -1,0 +1,14 @@
+{
+  "clangd": {
+    "version": "22.1.6",
+    "license": "Apache-2.0 WITH LLVM-exception",
+    "artifacts": {
+      "aarch64-apple-darwin": {
+        "url": "https://github.com/clangd/clangd/releases/download/22.1.6/clangd-mac-22.1.6.zip",
+        "sha256": "631aef462556cbd74e0ebaae1778a38d1997d0ba3371652ca54f82652a179e7d",
+        "strip_prefix": "clangd_22.1.6",
+        "include": ["LICENSE.TXT", "bin/clangd", "lib/clang/22/include/"]
+      }
+    }
+  }
+}

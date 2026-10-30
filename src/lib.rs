@@ -14,6 +14,8 @@
 //! ```
 
 mod backend;
+#[cfg(feature = "embed")]
+pub mod bundle;
 mod capabilities;
 pub mod config;
 mod gateway;

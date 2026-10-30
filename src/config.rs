@@ -26,6 +26,19 @@ impl Config {
     pub fn backend_mut(&mut self, name: &str) -> Option<&mut BackendSpec> {
         self.backends.iter_mut().find(|b| b.name == name)
     }
+
+    /// Runs the backends an installed bundle provides from that installation.
+    #[cfg(feature = "embed")]
+    pub fn use_installation(&mut self, installation: &crate::bundle::Installation) {
+        for backend in &installation.manifest.backends {
+            if let (Some(spec), Some(program)) = (
+                self.backend_mut(&backend.name),
+                installation.program(&backend.name),
+            ) {
+                spec.set_program(program);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
