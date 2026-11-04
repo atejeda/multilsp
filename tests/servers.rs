@@ -23,7 +23,6 @@ fn data_dir() -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR")).join("data")
 }
 
-#[cfg(all(feature = "embed", target_os = "macos", target_arch = "aarch64"))]
 fn multilsp(args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_multilsp"))
         .args(args)
@@ -259,12 +258,44 @@ async fn gopls_and_clangd_together() {
     server.finish().await;
 }
 
-/// The clangd embedded for macOS on Apple silicon: installed on first launch, used without
-/// anything on PATH, verifiable and repairable.
-#[cfg(all(feature = "embed", target_os = "macos", target_arch = "aarch64"))]
+/// The backends this binary embeds, from `multilsp bundle info` (empty when nothing is embedded).
+fn embedded_backends() -> Vec<String> {
+    let output = multilsp(&["bundle", "info"]);
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let info = String::from_utf8(output.stdout).unwrap();
+    info.lines()
+        .filter(|l| !l.starts_with("bundle") && !l.starts_with("location"))
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
+fn install_location() -> PathBuf {
+    let info = String::from_utf8(multilsp(&["bundle", "info"]).stdout).unwrap();
+    let location = info
+        .lines()
+        .find_map(|l| l.strip_prefix("location"))
+        .unwrap();
+    PathBuf::from(location.trim())
+}
+
+/// A directory holding only a link to `program`, for a PATH that offers nothing else.
+fn path_with(dir: &Path, programs: &[&Path]) -> std::ffi::OsString {
+    for program in programs {
+        std::os::unix::fs::symlink(program, dir.join(program.file_name().unwrap())).unwrap();
+    }
+    dir.as_os_str().to_owned()
+}
+
+/// Embedded clangd: installed on first launch, used with nothing on PATH, verifiable and
+/// repairable.
 #[tokio::test]
 async fn embedded_clangd() {
-    // Nothing on PATH, so only the embedded clangd can answer.
+    if !embedded_backends().iter().any(|b| b == "clangd") {
+        eprintln!("skipping: clangd is not embedded in this build");
+        return;
+    }
     let empty = tempfile::tempdir().unwrap();
     let env = [("PATH", empty.path().as_os_str())];
     let mut server = Server::start_with_env(&[], &[("main.c", C_SOURCE)], &env).await;
@@ -274,20 +305,12 @@ async fn embedded_clangd() {
     assert!(hover.contains("add"), "{hover}");
     server.finish().await;
 
-    let info = multilsp(&["bundle", "info"]);
-    let info = String::from_utf8(info.stdout).unwrap();
-    assert!(info.contains("clangd"), "{info}");
-    let location = info
-        .lines()
-        .find_map(|l| l.strip_prefix("location"))
-        .unwrap()
-        .trim();
-    let clangd = Path::new(location).join("clangd/bin/clangd");
-    assert!(clangd.is_file(), "{}", clangd.display());
+    let location = install_location();
+    assert!(location.join("clangd/bin/clangd").is_file());
     assert!(multilsp(&["bundle", "verify"]).status.success());
 
     // Same-size corruption is caught by verify and fixed by repair.
-    let license = Path::new(location).join("clangd/LICENSE.TXT");
+    let license = location.join("clangd/LICENSE.TXT");
     let size = std::fs::metadata(&license).unwrap().len() as usize;
     std::fs::write(&license, vec![b'x'; size]).unwrap();
     let verify = multilsp(&["bundle", "verify"]);
@@ -295,4 +318,34 @@ async fn embedded_clangd() {
     assert!(String::from_utf8_lossy(&verify.stdout).contains("LICENSE.TXT"));
     assert!(multilsp(&["bundle", "repair"]).status.success());
     assert!(multilsp(&["bundle", "verify"]).status.success());
+}
+
+/// Embedded gopls (packaged with `MULTILSP_EMBED_GOPLS`): used with only `go` on PATH, which
+/// gopls itself needs to load packages.
+#[tokio::test]
+async fn embedded_gopls() {
+    if !embedded_backends().iter().any(|b| b == "gopls") {
+        eprintln!(
+            "skipping: gopls is not embedded (build with MULTILSP_EMBED_GOPLS=/path/to/gopls)"
+        );
+        return;
+    }
+    let Some(go) = find("go", "MULTILSP_GO") else {
+        eprintln!("skipping: go not found");
+        return;
+    };
+    let bin = tempfile::tempdir().unwrap();
+    let path = path_with(bin.path(), &[&go]);
+    let env = [("PATH", path.as_os_str())];
+    let files = [
+        ("go.mod", "module example.com/hello\n\ngo 1.21\n"),
+        ("main.go", GO_SOURCE),
+    ];
+    let mut server = Server::start_with_env(&[], &files, &env).await;
+    assert_ne!(server.initialize().await["hoverProvider"], Value::Null);
+    let uri = server.open("main.go", "go", GO_SOURCE).await;
+    let hover = server.hover(&uri, 5, 6).await;
+    assert!(hover.contains("Println"), "{hover}");
+    server.finish().await;
+    assert!(install_location().join("gopls/gopls").is_file());
 }

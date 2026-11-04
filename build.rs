@@ -1,7 +1,10 @@
 //! With the `embed` feature (on by default), builds the language-server bundle for the target and
-//! embeds it: clangd is downloaded from its pinned release and checked against the pinned SHA-256
-//! (see `bundle/sources.json`). On a target with no pinned artifacts the bundle is empty and the
-//! build warns.
+//! embeds it. Nothing is compiled; for each backend in `bundle/sources.json`:
+//!
+//! - `MULTILSP_EMBED_<NAME>=/path/to/executable` (e.g. `MULTILSP_EMBED_GOPLS`) packages that
+//!   binary as-is, after checking it is an executable for the target;
+//! - otherwise the release pinned for the target is downloaded and checked against its SHA-256;
+//! - otherwise the backend is not embedded and runs from PATH.
 //!
 //! Downloads are cached in `MULTILSP_BUNDLE_CACHE` (default: `target/bundle-cache`).
 
@@ -23,14 +26,22 @@ type Result<T> = std::result::Result<T, String>;
 
 #[derive(Deserialize)]
 struct Sources {
-    clangd: ClangdSource,
+    /// Keyed by backend name, as in `BackendSpec::name`.
+    backends: BTreeMap<String, BackendSource>,
 }
 
 #[derive(Deserialize)]
-struct ClangdSource {
-    version: String,
+struct BackendSource {
+    /// SPDX license expression.
     license: String,
+    /// Version of the pinned artifacts.
+    #[serde(default)]
+    version: Option<String>,
+    /// Executable inside an extracted artifact.
+    #[serde(default)]
+    program: Option<String>,
     /// Keyed by Rust target triple.
+    #[serde(default)]
     artifacts: BTreeMap<String, Artifact>,
 }
 
@@ -81,26 +92,40 @@ fn build_bundle() -> Result<()> {
 
     fs::create_dir_all(&tree).map_err(|e| format!("{}: {e}", tree.display()))?;
 
-    let clangd = &sources.clangd;
     let mut backends = Vec::new();
-    match clangd.artifacts.get(&target) {
-        Some(artifact) => {
-            let archive = fetch(&artifact.url, &artifact.sha256, &cache)?;
-            extract(&archive, artifact, &tree.join("clangd"))?;
+    for (name, source) in &sources.backends {
+        let variable = format!("MULTILSP_EMBED_{}", name.to_uppercase());
+        println!("cargo::rerun-if-env-changed={variable}");
+        let dest = tree.join(name);
+        if let Some(path) = env::var_os(&variable).filter(|p| !p.is_empty()) {
+            let path = PathBuf::from(path);
+            println!("cargo::rerun-if-changed={}", path.display());
+            let program = embed_local_binary(&path, &target, &dest)
+                .map_err(|e| format!("{variable}: {e}"))?;
             backends.push(BackendEntry {
-                name: "clangd".into(),
-                version: clangd.version.clone(),
-                program: "clangd/bin/clangd".into(),
-                license: clangd.license.clone(),
+                name: name.clone(),
+                version: "local".into(),
+                program: format!("{name}/{program}"),
+                license: source.license.clone(),
+                source: path.display().to_string(),
+            });
+        } else if let Some(artifact) = source.artifacts.get(&target) {
+            let program = source.program.as_deref().ok_or_else(|| {
+                format!("bundle/sources.json: {name} has artifacts but no program")
+            })?;
+            let archive = fetch(&artifact.url, &artifact.sha256, &cache)?;
+            extract(&archive, artifact, &dest)?;
+            backends.push(BackendEntry {
+                name: name.clone(),
+                version: source.version.clone().unwrap_or_default(),
+                program: format!("{name}/{program}"),
+                license: source.license.clone(),
                 source: artifact.url.clone(),
             });
-        }
-        None => {
-            let known: Vec<_> = clangd.artifacts.keys().map(String::as_str).collect();
+        } else {
             println!(
-                "cargo::warning=no embedded language servers for {target} (supported: {}); \
-                 the binary will use servers from PATH",
-                known.join(", ")
+                "cargo::warning={name} is not embedded for {target} and will run from PATH; \
+                 set {variable}=/path/to/{name} to package one"
             );
         }
     }
@@ -141,6 +166,74 @@ fn build_bundle() -> Result<()> {
         ),
     )?;
     fs::remove_dir_all(&tree).map_err(|e| format!("{}: {e}", tree.display()))?;
+    Ok(())
+}
+
+/// Copies a user-supplied executable into the bundle and returns its file name. Refuses anything
+/// that is not a native executable for `target`, so a wrong-platform binary fails the build
+/// instead of failing on the user's machine.
+fn embed_local_binary(path: &Path, target: &str, dest: &Path) -> Result<String> {
+    if !path.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    check_executable_for(path, target)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    fs::create_dir_all(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    let copy = dest.join(&name);
+    fs::copy(path, &copy).map_err(|e| format!("copying {}: {e}", path.display()))?;
+    set_executable(&copy, true)?;
+    Ok(name)
+}
+
+/// Checks the ELF or Mach-O header against the target's OS and CPU. A macOS universal binary is
+/// accepted if it has a slice for the target; it is thinned later.
+fn check_executable_for(path: &Path, target: &str) -> Result<()> {
+    let mut header = [0u8; 20];
+    let n = File::open(path)
+        .and_then(|mut f| f.read(&mut header))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let arm = target.starts_with("aarch64");
+    let (wanted, found) = if target.contains("-linux-") {
+        let machine = (n >= 20 && header[..4] == *b"\x7fELF")
+            .then(|| u16::from_le_bytes([header[18], header[19]]));
+        let found = match machine {
+            Some(62) => "Linux x86_64",
+            Some(183) => "Linux arm64",
+            Some(_) => "Linux, another CPU",
+            None => "not a Linux executable",
+        };
+        (if arm { "Linux arm64" } else { "Linux x86_64" }, found)
+    } else if target.contains("-apple-darwin") {
+        let be32 = |at: usize| u32::from_be_bytes(header[at..at + 4].try_into().unwrap());
+        let le32 = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().unwrap());
+        let found = if n < 8 {
+            "not a macOS executable"
+        } else if le32(0) == 0xfeed_facf {
+            match le32(4) {
+                0x0100_000c => "macOS arm64",
+                0x0100_0007 => "macOS x86_64",
+                _ => "macOS, another CPU",
+            }
+        } else if be32(0) == 0xcafe_babe {
+            // Universal: the slice is checked when thinning.
+            if arm { "macOS arm64" } else { "macOS x86_64" }
+        } else {
+            "not a macOS executable"
+        };
+        (if arm { "macOS arm64" } else { "macOS x86_64" }, found)
+    } else {
+        return Err(format!("embedding binaries is not supported for {target}"));
+    };
+    if wanted != found {
+        return Err(format!(
+            "{} is {found}, but the build target {target} needs {wanted}",
+            path.display()
+        ));
+    }
     Ok(())
 }
 

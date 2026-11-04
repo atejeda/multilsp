@@ -8,9 +8,13 @@ starts the real language servers and routes each document to the one that handle
 
 Two backends: **clangd** (C, C++, Objective-C, CUDA) and **gopls** (Go).
 
-On **macOS with Apple silicon** (`aarch64-apple-darwin`), clangd is embedded in the binary and
-needs nothing installed. gopls is not embedded yet and runs from PATH. On other targets
-nothing is embedded and both run from PATH.
+Servers can be embedded in the binary so nothing needs to be installed:
+
+- **clangd** is embedded automatically on macOS with Apple silicon (`aarch64-apple-darwin`).
+- **gopls**, or any backend, is embedded on any target when you supply its binary at build
+  time (see below).
+
+A backend that is not embedded runs from PATH.
 
 ## Build
 
@@ -26,6 +30,21 @@ checks it against the pinned SHA-256, keeps the `clangd` binary (arm64 slice onl
 headers and its license, and embeds them compressed (about 18 MB). Nothing is compiled from
 source. Downloads are cached in `target/bundle-cache` (override with `MULTILSP_BUNDLE_CACHE`), so
 later builds work offline.
+
+### Packaging your own binaries
+
+Set `MULTILSP_EMBED_<BACKEND>` to an executable to package it as-is, on any OS and target:
+
+```sh
+MULTILSP_EMBED_GOPLS=$(go env GOPATH)/bin/gopls cargo build --release
+```
+
+The build checks that the file is an executable for the build target (e.g. a macOS arm64
+Mach-O for `aarch64-apple-darwin`) and fails otherwise; a macOS universal binary is thinned to
+the target's slice. The variable takes precedence over a pinned download, but a lone `clangd`
+binary lacks clangd's builtin headers, so prefer the pinned download for clangd.
+
+gopls still needs the Go toolchain (`go`) on PATH at runtime to load packages.
 
 `cargo build --release --no-default-features` builds without embedded servers.
 
@@ -96,9 +115,10 @@ cargo test
 The gateway tests use in-process fake backends and need nothing installed. `tests/servers.rs`
 runs the real binary against gopls and clangd, found through `MULTILSP_GOPLS` /
 `MULTILSP_CLANGD`, then `PATH`, `$GOPATH/bin` and `~/go/bin`; each test is skipped when its
-servers are missing (run with `-- --nocapture` to see skips). On Apple silicon,
-`embedded_clangd` runs the embedded clangd with an empty PATH and exercises
-`bundle verify`/`repair`; tests install into `target/tmp/data`, not your data directory.
+servers are missing (run with `-- --nocapture` to see skips). `embedded_clangd` and
+`embedded_gopls` run whichever servers the build embedded, with nothing else on PATH (gopls
+gets only `go`), and exercise `bundle verify`/`repair`; tests install into `target/tmp/data`,
+not your data directory.
 
 Install gopls with `go install golang.org/x/tools/gopls@latest`; clangd comes with LLVM
 (`brew install llvm`, `apt install clangd`).
