@@ -22,6 +22,7 @@ impl Default for Config {
                 BackendSpec::clangd(),
                 BackendSpec::rust_analyzer(),
                 BackendSpec::typescript(),
+                BackendSpec::ty(),
             ],
         }
     }
@@ -115,6 +116,22 @@ impl BackendSpec {
                 Launch::Command {
                     program: "tsc".into(),
                     args: vec!["--lsp".into(), "--stdio".into()],
+                    env: Vec::new(),
+                },
+            )
+        }
+    }
+
+    /// Astral's ty, for Python (`ty server`).
+    pub fn ty() -> Self {
+        Self {
+            language_ids: strings(&["python"]),
+            extensions: strings(&["py", "pyi"]),
+            ..Self::new(
+                "ty",
+                Launch::Command {
+                    program: "ty".into(),
+                    args: vec!["server".into()],
                     env: Vec::new(),
                 },
             )

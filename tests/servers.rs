@@ -17,6 +17,7 @@ const GO_SOURCE: &str =
 const RUST_SOURCE: &str = "fn main() {\n    let s = String::new();\n    println!(\"{s}\");\n}\n";
 const TS_SOURCE: &str =
     "const n = Math.max(1, 2);\nexport function twice(x: number): number {\n    return x * 2;\n}\n";
+const PY_SOURCE: &str = "import os\n\nprint(os.getcwd())\n";
 const C_SOURCE: &str =
     "int add(int a, int b) { return a + b; }\n\nint main(void) { return add(1, 2); }\n";
 
@@ -404,5 +405,24 @@ async fn embedded_typescript() {
     // Line 0 is `const n = Math.max(1, 2);`; character 15 is inside `max`.
     let hover = server.hover(&uri, 0, 15).await;
     assert!(hover.contains("max"), "{hover}");
+    server.finish().await;
+}
+
+/// Embedded ty: works with nothing on PATH (no Python interpreter), resolving the standard
+/// library from its bundled stubs.
+#[tokio::test]
+async fn embedded_ty() {
+    if !embedded_backends().iter().any(|b| b == "ty") {
+        eprintln!("skipping: ty is not embedded in this build");
+        return;
+    }
+    let empty = tempfile::tempdir().unwrap();
+    let env = [("PATH", empty.path().as_os_str())];
+    let mut server = Server::start_with_env(&[], &[("main.py", PY_SOURCE)], &env).await;
+    assert_ne!(server.initialize().await["hoverProvider"], Value::Null);
+    let uri = server.open("main.py", "python", PY_SOURCE).await;
+    // Line 2 is `print(os.getcwd())`; character 10 is inside `getcwd`.
+    let hover = server.hover(&uri, 2, 10).await;
+    assert!(hover.contains("getcwd"), "{hover}");
     server.finish().await;
 }
