@@ -6,47 +6,48 @@ starts the real language servers and routes each document to the one that handle
 
 ## Status
 
-Two backends: **clangd** (C, C++, Objective-C, CUDA) and **gopls** (Go).
+Two backends: **clangd** (C, C++, Objective-C, CUDA) and **gopls** (Go). Both are embedded in
+the binary for every platform that has a leaf under [embed/](embed/README.md):
 
-Servers can be embedded in the binary so nothing needs to be installed:
+| Platform       | clangd | gopls |
+|----------------|--------|-------|
+| macOS arm64    | yes    | yes   |
+| macOS x86_64   | yes    | yes   |
+| Linux x86_64   | yes    | yes   |
+| Linux arm64    | -      | yes   |
 
-- **clangd** is embedded automatically on macOS with Apple silicon (`aarch64-apple-darwin`).
-- **gopls**, or any backend, is embedded on any target when you supply its binary at build
-  time (see below).
-
-A backend that is not embedded runs from PATH.
+A backend that is not embedded runs from PATH. gopls still needs the Go toolchain (`go`) on
+PATH at runtime to load packages.
 
 ## Build
 
-Requires Rust 1.89 or newer and `curl`.
+Requires Rust 1.89 or newer, bash, `curl` and `unzip`, plus Go to produce the embedded gopls.
 
 ```sh
 cargo build --release
 # binary: target/release/multilsp
 ```
 
-The build downloads the official clangd release pinned in [bundle/sources.json](bundle/sources.json),
-checks it against the pinned SHA-256, keeps the `clangd` binary (arm64 slice only), its builtin
-headers and its license, and embeds them compressed (about 18 MB). Nothing is compiled from
-source. Downloads are cached in `target/bundle-cache` (override with `MULTILSP_BUNDLE_CACHE`), so
-later builds work offline.
+Each technology has one leaf per version and platform:
 
-### Packaging your own binaries
-
-Set `MULTILSP_EMBED_<BACKEND>` to an executable to package it as-is, on any OS and target:
-
-```sh
-MULTILSP_EMBED_GOPLS=$(go env GOPATH)/bin/gopls cargo build --release
+```text
+embed/<tech>/<version>/<os>-<arch>/build.sh    fills binaries/
+embed/<tech>/<version>/<os>-<arch>/binaries/   embedded as-is
 ```
 
-The build checks that the file is an executable for the build target (e.g. a macOS arm64
-Mach-O for `aarch64-apple-darwin`) and fails otherwise; a macOS universal binary is thinned to
-the target's slice. The variable takes precedence over a pinned download, but a lone `clangd`
-binary lacks clangd's builtin headers, so prefer the pinned download for clangd.
+The build runs a leaf's `build.sh` only when its `binaries/` is missing: clangd's downloads the
+official release and checks its pinned SHA-256; gopls's cross-compiles the pinned module, since
+no gopls binaries are published. Downloads are cached in `target/bundle-cache`. See
+[embed/README.md](embed/README.md) for the format and for adding versions or platforms.
 
-gopls still needs the Go toolchain (`go`) on PATH at runtime to load packages.
+| Variable                        | Effect                                           |
+|---------------------------------|--------------------------------------------------|
+| `MULTILSP_EMBED_<TECH>=off`     | don't embed that technology                      |
+| `MULTILSP_EMBED_<TECH>=/path`   | embed that executable instead                    |
+| `MULTILSP_EMBED_<TECH>_VERSION` | use that version instead of the highest          |
 
-`cargo build --release --no-default-features` builds without embedded servers.
+Every embedded executable is checked against the build target, so a wrong-platform binary
+fails the build. `cargo build --release --no-default-features` embeds nothing.
 
 ## Embedded servers
 

@@ -1,1 +1,3 @@
 /target
+/embed/**/binaries/
+/embed/**/binaries.partial/

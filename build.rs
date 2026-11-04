@@ -1,63 +1,39 @@
-//! With the `embed` feature (on by default), builds the language-server bundle for the target and
-//! embeds it. Nothing is compiled; for each backend in `bundle/sources.json`:
+//! With the `embed` feature (on by default), packages language servers into the binary from
+//! `embed/` (see `embed/README.md`):
 //!
-//! - `MULTILSP_EMBED_<NAME>=/path/to/executable` (e.g. `MULTILSP_EMBED_GOPLS`) packages that
-//!   binary as-is, after checking it is an executable for the target;
-//! - otherwise the release pinned for the target is downloaded and checked against its SHA-256;
-//! - otherwise the backend is not embedded and runs from PATH.
+//! ```text
+//! embed/<tech>/<version>/<os>-<arch>/build.sh     fills binaries/ (download, build, ...)
+//! embed/<tech>/<version>/<os>-<arch>/binaries/    what gets embedded
+//! ```
 //!
-//! Downloads are cached in `MULTILSP_BUNDLE_CACHE` (default: `target/bundle-cache`).
+//! For each technology the build uses, in order of precedence:
+//!
+//! - `MULTILSP_EMBED_<TECH>=off`: nothing; the backend runs from PATH;
+//! - `MULTILSP_EMBED_<TECH>=/path/to/executable`: that binary;
+//! - the target platform's leaf at `MULTILSP_EMBED_<TECH>_VERSION`, or else the highest version
+//!   that has one. Its `binaries/` is used as-is when present; otherwise `build.sh` creates it.
+//!
+//! Every embedded executable is checked against the build target, and macOS universal binaries
+//! are thinned to the target's slice.
 
 #[allow(dead_code)]
 #[path = "src/bundle/format.rs"]
 mod format;
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use format::{BackendEntry, FileEntry, Manifest};
-use serde::Deserialize;
 
 type Result<T> = std::result::Result<T, String>;
 
-#[derive(Deserialize)]
-struct Sources {
-    /// Keyed by backend name, as in `BackendSpec::name`.
-    backends: BTreeMap<String, BackendSource>,
-}
-
-#[derive(Deserialize)]
-struct BackendSource {
-    /// SPDX license expression.
-    license: String,
-    /// Version of the pinned artifacts.
-    #[serde(default)]
-    version: Option<String>,
-    /// Executable inside an extracted artifact.
-    #[serde(default)]
-    program: Option<String>,
-    /// Keyed by Rust target triple.
-    #[serde(default)]
-    artifacts: BTreeMap<String, Artifact>,
-}
-
-#[derive(Deserialize)]
-struct Artifact {
-    url: String,
-    sha256: String,
-    /// Top-level directory inside the zip.
-    strip_prefix: String,
-    /// Paths to keep, relative to `strip_prefix`; entries ending in `/` keep a whole directory.
-    include: Vec<String>,
-}
-
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
-    println!("cargo::rerun-if-changed=bundle/sources.json");
+    println!("cargo::rerun-if-changed=embed");
     println!("cargo::rerun-if-changed=src/bundle/format.rs");
     println!("cargo::rerun-if-env-changed=MULTILSP_BUNDLE_CACHE");
     if env::var_os("CARGO_FEATURE_EMBED").is_none() {
@@ -65,7 +41,10 @@ fn main() {
     }
     if let Err(e) = build_bundle() {
         eprintln!("error: building the embedded language-server bundle failed:\n  {e}");
-        eprintln!("hint: build with `--no-default-features` for a binary without embedded servers");
+        eprintln!(
+            "hint: MULTILSP_EMBED_<TECH>=off skips one technology; \
+             `--no-default-features` builds without embedded servers"
+        );
         std::process::exit(1);
     }
 }
@@ -74,8 +53,6 @@ fn build_bundle() -> Result<()> {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target = env::var("TARGET").unwrap();
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let sources: Sources = serde_json::from_str(&read(&manifest_dir.join("bundle/sources.json"))?)
-        .map_err(|e| format!("bundle/sources.json: {e}"))?;
     let cache = match env::var_os("MULTILSP_BUNDLE_CACHE") {
         Some(dir) => PathBuf::from(dir),
         None => env::var_os("CARGO_TARGET_DIR")
@@ -89,48 +66,84 @@ fn build_bundle() -> Result<()> {
     if tree.exists() {
         fs::remove_dir_all(&tree).map_err(|e| format!("{}: {e}", tree.display()))?;
     }
-
     fs::create_dir_all(&tree).map_err(|e| format!("{}: {e}", tree.display()))?;
 
+    let embed = manifest_dir.join("embed");
+    let platform = platform(&target);
     let mut backends = Vec::new();
-    for (name, source) in &sources.backends {
-        let variable = format!("MULTILSP_EMBED_{}", name.to_uppercase());
+    for tech in subdirectories(&embed)? {
+        let variable = format!("MULTILSP_EMBED_{}", tech.to_uppercase());
         println!("cargo::rerun-if-env-changed={variable}");
-        let dest = tree.join(name);
-        if let Some(path) = env::var_os(&variable).filter(|p| !p.is_empty()) {
+        println!("cargo::rerun-if-env-changed={variable}_VERSION");
+        let dest = tree.join(&tech);
+        let choice = env::var_os(&variable).filter(|v| !v.is_empty());
+        if choice.as_deref() == Some("off".as_ref()) {
+            continue;
+        }
+        let version = env::var(format!("{variable}_VERSION")).ok();
+        let leaf = select(&embed, &tech, platform.as_deref(), version.as_deref())?;
+        let license = leaf
+            .as_ref()
+            .and_then(|(_, dir)| header(&dir.join("build.sh"), "license"))
+            .unwrap_or_else(|| "unknown".into());
+
+        if let Some(path) = choice {
             let path = PathBuf::from(path);
             println!("cargo::rerun-if-changed={}", path.display());
             let program = embed_local_binary(&path, &target, &dest)
                 .map_err(|e| format!("{variable}: {e}"))?;
             backends.push(BackendEntry {
-                name: name.clone(),
+                name: tech.clone(),
                 version: "local".into(),
-                program: format!("{name}/{program}"),
-                license: source.license.clone(),
+                program: format!("{tech}/{program}"),
+                license,
                 source: path.display().to_string(),
             });
-        } else if let Some(artifact) = source.artifacts.get(&target) {
-            let program = source.program.as_deref().ok_or_else(|| {
-                format!("bundle/sources.json: {name} has artifacts but no program")
-            })?;
-            let archive = fetch(&artifact.url, &artifact.sha256, &cache)?;
-            extract(&archive, artifact, &dest)?;
-            backends.push(BackendEntry {
-                name: name.clone(),
-                version: source.version.clone().unwrap_or_default(),
-                program: format!("{name}/{program}"),
-                license: source.license.clone(),
-                source: artifact.url.clone(),
-            });
-        } else {
-            println!(
-                "cargo::warning={name} is not embedded for {target} and will run from PATH; \
-                 set {variable}=/path/to/{name} to package one"
-            );
+            continue;
         }
+        let Some((version, dir)) = leaf else {
+            println!(
+                "cargo::warning={tech} has nothing for {target} and will run from PATH; \
+                 add embed/{tech}/<version>/{}/build.sh or set {variable}=/path/to/{tech}",
+                platform.as_deref().unwrap_or("<os>-<arch>")
+            );
+            continue;
+        };
+        let binaries = prepare(&dir, &target, platform.as_deref().unwrap(), &cache)?;
+        let program = match header(&dir.join("build.sh"), "program") {
+            Some(program) => program,
+            None => [tech.clone(), format!("bin/{tech}")]
+                .into_iter()
+                .find(|p| binaries.join(p).is_file())
+                .ok_or_else(|| {
+                    format!(
+                        "{}: no `# program:` line and no {tech} executable",
+                        dir.display()
+                    )
+                })?,
+        };
+        copy_tree(&binaries, &dest)?;
+        backends.push(BackendEntry {
+            name: tech.clone(),
+            version,
+            program: format!("{tech}/{program}"),
+            license,
+            source: dir
+                .strip_prefix(&manifest_dir)
+                .unwrap_or(&dir)
+                .display()
+                .to_string(),
+        });
     }
     if target.contains("apple") {
         thin_universal_binaries(&tree, &target)?;
+    }
+    for backend in &backends {
+        let program = tree.join(&backend.program);
+        if !program.is_file() {
+            return Err(format!("{}: {} is missing", backend.name, backend.program));
+        }
+        check_executable_for(&program, &target).map_err(|e| format!("{}: {e}", backend.name))?;
     }
 
     let manifest = Manifest {
@@ -167,6 +180,86 @@ fn build_bundle() -> Result<()> {
     )?;
     fs::remove_dir_all(&tree).map_err(|e| format!("{}: {e}", tree.display()))?;
     Ok(())
+}
+
+/// The leaf for `tech` on `platform`: the requested version, or the highest one that has a leaf
+/// for the platform. Returns the version and the leaf directory.
+fn select(
+    embed: &Path,
+    tech: &str,
+    platform: Option<&str>,
+    version: Option<&str>,
+) -> Result<Option<(String, PathBuf)>> {
+    let Some(platform) = platform else {
+        return Ok(None);
+    };
+    let mut versions: Vec<String> = subdirectories(&embed.join(tech))?
+        .into_iter()
+        .filter(|v| embed.join(tech).join(v).join(platform).is_dir())
+        .collect();
+    versions.sort_by(|a, b| compare_versions(a, b));
+    let version = match version {
+        Some(v) if versions.iter().any(|have| have == v) => v.to_string(),
+        Some(v) => {
+            return Err(format!(
+                "{tech} {v} has nothing for {platform} (available: {})",
+                versions.join(", ")
+            ));
+        }
+        None => match versions.pop() {
+            Some(v) => v,
+            None => return Ok(None),
+        },
+    };
+    let dir = embed.join(tech).join(&version).join(platform);
+    Ok(Some((version, dir)))
+}
+
+/// Returns the leaf's `binaries/`, running its `build.sh` first if it does not exist. The script
+/// writes into a staging directory that is renamed into place only when it succeeds.
+fn prepare(leaf: &Path, target: &str, platform: &str, cache: &Path) -> Result<PathBuf> {
+    let binaries = leaf.join("binaries");
+    if binaries.is_dir() {
+        return Ok(binaries);
+    }
+    let script = leaf.join("build.sh");
+    if !script.is_file() {
+        return Err(format!(
+            "{}: neither binaries/ nor build.sh",
+            leaf.display()
+        ));
+    }
+    let staging = leaf.join("binaries.partial");
+    if staging.exists() {
+        fs::remove_dir_all(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
+    }
+    fs::create_dir_all(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
+    let mut command = Command::new("bash");
+    command
+        .arg(&script)
+        .current_dir(leaf)
+        .env("OUT", &staging)
+        .env("MULTILSP_CACHE", cache)
+        .env("MULTILSP_TARGET", target)
+        .env("MULTILSP_PLATFORM", platform)
+        // Script output goes to the build log, never into the embedded files.
+        .stdout(std::process::Stdio::inherit());
+    if let Err(e) = run(command, &format!("{}", script.display())) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    fs::rename(&staging, &binaries).map_err(|e| format!("{}: {e}", binaries.display()))?;
+    Ok(binaries)
+}
+
+/// The value of a `# key: value` comment line in a script's header.
+fn header(script: &Path, key: &str) -> Option<String> {
+    let text = fs::read_to_string(script).ok()?;
+    let prefix = format!("# {key}:");
+    text.lines()
+        .take_while(|line| line.starts_with('#') || line.trim().is_empty())
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(|value| value.trim().to_string())
 }
 
 /// Copies a user-supplied executable into the bundle and returns its file name. Refuses anything
@@ -232,94 +325,6 @@ fn check_executable_for(path: &Path, target: &str) -> Result<()> {
         return Err(format!(
             "{} is {found}, but the build target {target} needs {wanted}",
             path.display()
-        ));
-    }
-    Ok(())
-}
-
-/// Returns the cached download of `url`, fetching it with curl first if needed.
-fn fetch(url: &str, sha256: &str, cache: &Path) -> Result<PathBuf> {
-    let name = url.rsplit('/').next().unwrap_or("download");
-    let downloads = cache.join("downloads");
-    let path = downloads.join(format!("{sha256}-{name}"));
-    if path.exists() && hash(&path)? == sha256 {
-        return Ok(path);
-    }
-    fs::create_dir_all(&downloads).map_err(|e| format!("{}: {e}", downloads.display()))?;
-    let partial = path.with_extension("partial");
-    let mut curl = Command::new("curl");
-    curl.args([
-        "--fail",
-        "--location",
-        "--silent",
-        "--show-error",
-        "--retry",
-        "3",
-        "--output",
-    ])
-    .arg(&partial)
-    .arg(url);
-    run(curl, &format!("downloading {url}"))?;
-    let actual = hash(&partial)?;
-    if actual != sha256 {
-        let _ = fs::remove_file(&partial);
-        return Err(format!(
-            "checksum mismatch for {url}: expected {sha256}, got {actual}"
-        ));
-    }
-    fs::rename(&partial, &path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(path)
-}
-
-fn extract(archive: &Path, artifact: &Artifact, dest: &Path) -> Result<()> {
-    let open = || File::open(archive).map_err(|e| format!("{}: {e}", archive.display()));
-    let keep = |name: &str| -> Option<PathBuf> {
-        let relative = name
-            .strip_prefix(&artifact.strip_prefix)?
-            .strip_prefix('/')?;
-        let wanted = artifact
-            .include
-            .iter()
-            .any(|keep| match keep.strip_suffix('/') {
-                Some(dir) => relative.starts_with(dir) && relative[dir.len()..].starts_with('/'),
-                None => relative == keep,
-            });
-        let path = PathBuf::from(relative);
-        (wanted && format::is_safe_relative(&path)).then_some(path)
-    };
-    let mut kept = 0;
-    let mut save = |relative: &Path, reader: &mut dyn Read, mode: u32| -> Result<()> {
-        let path = dest.join(relative);
-        fs::create_dir_all(path.parent().unwrap())
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut file = File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        io::copy(reader, &mut file).map_err(|e| format!("{}: {e}", path.display()))?;
-        set_executable(&path, mode & 0o111 != 0)?;
-        kept += 1;
-        Ok(())
-    };
-    let mut zip = zip::ZipArchive::new(BufReader::new(open()?))
-        .map_err(|e| format!("{}: {e}", archive.display()))?;
-    for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .map_err(|e| format!("{}: {e}", archive.display()))?;
-        if entry.is_dir() {
-            continue;
-        }
-        let name = entry
-            .name()
-            .map_err(|e| format!("{}: {e}", archive.display()))?
-            .into_owned();
-        if let Some(relative) = keep(&name) {
-            let mode = entry.unix_mode().unwrap_or(0o644);
-            save(&relative, &mut entry, mode)?;
-        }
-    }
-    if kept == 0 {
-        return Err(format!(
-            "{} contained none of the expected files",
-            artifact.url
         ));
     }
     Ok(())
@@ -410,14 +415,71 @@ fn hash(path: &Path) -> Result<String> {
     format::sha256_file(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn read(path: &Path) -> Result<String> {
-    fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
-}
-
 fn write(path: &Path, contents: &str) -> Result<()> {
     File::create(path)
         .and_then(|mut f| f.write_all(contents.as_bytes()))
         .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn subdirectories(dir: &Path) -> Result<Vec<String>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Copies a directory's files, except dotfiles, preserving permissions.
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    for entry in fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let (source, target) = (entry.path(), to.join(entry.file_name()));
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            copy_tree(&source, &target)?;
+        } else {
+            fs::copy(&source, &target).map_err(|e| format!("copying {}: {e}", source.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Orders `v0.24.0`, `22.1.6`, `1.10` numerically component by component.
+fn compare_versions(a: &str, b: &str) -> Ordering {
+    let parts = |v: &str| -> Vec<u64> {
+        v.trim_start_matches('v')
+            .split(['.', '-'])
+            .map(|p| p.parse().unwrap_or(0))
+            .collect()
+    };
+    parts(a).cmp(&parts(b)).then_with(|| a.cmp(b))
+}
+
+/// The recipe directory name for a target, e.g. `macos-arm64`.
+fn platform(target: &str) -> Option<String> {
+    let arch = match target.split('-').next()? {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        _ => return None,
+    };
+    let os = if target.contains("-apple-darwin") {
+        "macos"
+    } else if target.contains("-linux-") {
+        "linux"
+    } else {
+        return None;
+    };
+    Some(format!("{os}-{arch}"))
 }
 
 #[cfg(unix)]
