@@ -2,7 +2,6 @@
 
 ```text
 embed/
-  lib.sh                                  helpers the scripts source
   <tech>/<version>/<os>-<arch>/build.sh   puts the files to embed into $OUT
   <tech>/<version>/<os>-<arch>/binaries/  the result; this is what gets embedded
 ```
@@ -38,13 +37,8 @@ The script's header declares what it produces:
 
 Without `# program:`, `<tech>` or `bin/<tech>` is used.
 
-## lib.sh
-
-| Function                                       | Does                                                         |
-|------------------------------------------------|--------------------------------------------------------------|
-| `fetch URL SHA256`                             | downloads once into the cache, fails on a hash mismatch, prints the path |
-| `unzip_into ZIP PREFIX PATH...`                | extracts `PREFIX/PATH` entries into `$OUT` (`dir/` takes a directory) |
-| `go_build MODULE VERSION GOOS GOARCH NAME`     | cross-compiles a Go module into `$OUT/NAME`, with its LICENSE |
+Each `build.sh` is self-contained: it has everything it needs to produce its files, with no
+shared helpers.
 
 ## Overrides
 
