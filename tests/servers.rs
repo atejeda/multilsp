@@ -285,14 +285,6 @@ fn install_location() -> PathBuf {
     PathBuf::from(location.trim())
 }
 
-/// A directory holding only a link to `program`, for a PATH that offers nothing else.
-fn path_with(dir: &Path, programs: &[&Path]) -> std::ffi::OsString {
-    for program in programs {
-        std::os::unix::fs::symlink(program, dir.join(program.file_name().unwrap())).unwrap();
-    }
-    dir.as_os_str().to_owned()
-}
-
 /// Embedded clangd: installed on first launch, used with nothing on PATH, verifiable and
 /// repairable.
 #[tokio::test]
@@ -325,23 +317,19 @@ async fn embedded_clangd() {
     assert!(multilsp(&["bundle", "verify"]).status.success());
 }
 
-/// Embedded gopls (packaged with `MULTILSP_EMBED_GOPLS`): used with only `go` on PATH, which
-/// gopls itself needs to load packages.
+/// Embedded gopls with its bundled Go toolchain: works with nothing on PATH.
 #[tokio::test]
 async fn embedded_gopls() {
     if !embedded_backends().iter().any(|b| b == "gopls") {
-        eprintln!(
-            "skipping: gopls is not embedded (build with MULTILSP_EMBED_GOPLS=/path/to/gopls)"
-        );
+        eprintln!("skipping: gopls is not embedded in this build");
         return;
     }
-    let Some(go) = find("go", "MULTILSP_GO") else {
-        eprintln!("skipping: go not found");
-        return;
-    };
-    let bin = tempfile::tempdir().unwrap();
-    let path = path_with(bin.path(), &[&go]);
-    let env = [("PATH", path.as_os_str())];
+    let empty = tempfile::tempdir().unwrap();
+    let gopath = tempfile::tempdir().unwrap();
+    let env = [
+        ("PATH", empty.path().as_os_str()),
+        ("GOPATH", gopath.path().as_os_str()),
+    ];
     let files = [
         ("go.mod", "module example.com/hello\n\ngo 1.21\n"),
         ("main.go", GO_SOURCE),
@@ -353,6 +341,7 @@ async fn embedded_gopls() {
     assert!(hover.contains("Println"), "{hover}");
     server.finish().await;
     assert!(install_location().join("gopls/gopls").is_file());
+    assert!(install_location().join("gopls/go/bin/go").is_file());
 }
 
 /// Embedded rust-analyzer with its bundled toolchain: with nothing on PATH, hovering a standard

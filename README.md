@@ -18,14 +18,15 @@ Three backends, embedded in the binary for every platform that has a leaf under
 
 A backend that is not embedded runs from PATH.
 
-rust-analyzer comes with its own Rust toolchain (cargo, rustc, rust-std, rust-src), so it works
-with nothing installed. gopls still needs the Go toolchain (`go`) on PATH at runtime. The full
+Each server comes with what it needs at runtime, so it works with nothing installed:
+rust-analyzer with its Rust toolchain (cargo, rustc, rust-std, rust-src), gopls with its Go
+toolchain. The full
 bundle is large: about 150 MB compressed in the binary and 700 MB installed on macOS arm64.
 
 ## Build
 
-Requires Rust 1.89 or newer, bash, `curl`, `tar` and `unzip`, plus Go to produce the embedded
-gopls. The first release build downloads about 330 MB and takes several minutes; later builds
+Requires Rust 1.89 or newer, bash, `curl`, `tar` and `unzip`. Go is not needed: the gopls leaf
+downloads a Go toolchain for the build machine to compile gopls. The first release build downloads about 330 MB and takes several minutes; later builds
 reuse each leaf's `binaries/`.
 
 ```sh
@@ -42,7 +43,7 @@ embed/<tech>/<version>/<os>-<arch>/binaries/   embedded as-is
 
 The build runs a leaf's `build.sh` only when its `binaries/` is missing: clangd's downloads the
 official release and checks its pinned SHA-256; gopls's cross-compiles the pinned module, since
-no gopls binaries are published. Downloads are cached in `target/bundle-cache`. See
+no gopls binaries are published, and adds the official Go toolchain. Downloads are cached in `target/bundle-cache`. See
 [embed/README.md](embed/README.md) for the format and for adding versions or platforms.
 
 | Variable                        | Effect                                           |
@@ -127,7 +128,7 @@ runs the real binary against gopls and clangd, found through `MULTILSP_GOPLS` /
 `MULTILSP_CLANGD`, then `PATH`, `$GOPATH/bin` and `~/go/bin`; each test is skipped when its
 servers are missing (run with `-- --nocapture` to see skips). `embedded_clangd`,
 `embedded_gopls` and `embedded_rust_analyzer` run whichever servers the build embedded, with
-nothing else on PATH (gopls gets only `go`), and exercise `bundle verify`/`repair`; tests install into `target/tmp/data`,
+nothing on PATH and exercise `bundle verify`/`repair`; tests install into `target/tmp/data`,
 not your data directory.
 
 Install gopls with `go install golang.org/x/tools/gopls@latest`; clangd comes with LLVM
