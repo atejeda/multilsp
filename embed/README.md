@@ -35,9 +35,10 @@ The script's header declares what it produces:
 # program: toolchain/bin/rust-analyzer       the executable, relative to binaries/
 # path: toolchain/bin                        put first on the server's PATH (repeatable)
 # env: CARGO={dir}/toolchain/bin/cargo       set for the server's process (repeatable)
+# args: --lsp --stdio                        arguments for the program
 ```
 
-Without `# program:`, `<tech>` or `bin/<tech>` is used. In `# env:` values, `{dir}` is where
+Without `# program:`, `<tech>` or `bin/<tech>` is used. In `# env:` and `# args:`, `{dir}` is where
 `binaries/` ends up installed. A leaf should carry everything its server needs at runtime (for
 rust-analyzer: cargo, rustc, rust-std and rust-src), even if that repeats files across
 technologies and versions; `# path:` and `# env:` make the server use them instead of whatever

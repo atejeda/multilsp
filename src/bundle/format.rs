@@ -36,6 +36,9 @@ pub struct BackendEntry {
     /// Directories, relative to the backend's installed directory, put first on its PATH.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path: Vec<String>,
+    /// Arguments for the backend's executable; `{dir}` as in `env`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

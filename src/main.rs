@@ -86,8 +86,18 @@ fn serve(args: ServeArgs) -> ! {
             );
             std::process::exit(2);
         };
-        // A user-chosen server runs with the user's environment, not the bundled one.
-        spec.launch = multilsp::Launch::command(path);
+        // A user-chosen server runs with the user's environment, not the bundled one, and with
+        // the backend's usual arguments.
+        let args =
+            multilsp::BackendSpec::defaults(&name).map_or_else(Vec::new, |d| match d.launch {
+                multilsp::Launch::Command { args, .. } => args,
+                multilsp::Launch::Connect(_) => Vec::new(),
+            });
+        spec.launch = multilsp::Launch::Command {
+            program: path,
+            args,
+            env: Vec::new(),
+        };
     }
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");

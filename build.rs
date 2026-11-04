@@ -100,6 +100,11 @@ fn build_bundle() -> Result<()> {
                 source: path.display().to_string(),
                 env: Vec::new(),
                 path: Vec::new(),
+                // The leaf's arguments still apply: they say how to start this kind of server.
+                args: leaf
+                    .as_ref()
+                    .map(|(_, dir)| split_args(&headers(&dir.join("build.sh"), "args")))
+                    .unwrap_or_default(),
             });
             continue;
         }
@@ -143,6 +148,7 @@ fn build_bundle() -> Result<()> {
                 })
                 .collect::<Result<_>>()?,
             path: headers(&dir.join("build.sh"), "path"),
+            args: split_args(&headers(&dir.join("build.sh"), "args")),
         });
     }
     if target.contains("apple") {
@@ -260,6 +266,14 @@ fn prepare(leaf: &Path, target: &str, platform: &str, cache: &Path) -> Result<Pa
     }
     fs::rename(&staging, &binaries).map_err(|e| format!("{}: {e}", binaries.display()))?;
     Ok(binaries)
+}
+
+/// `# args:` lines, split on whitespace.
+fn split_args(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .flat_map(|line| line.split_whitespace().map(str::to_string))
+        .collect()
 }
 
 /// The value of the first `# key: value` comment line in a script's header.

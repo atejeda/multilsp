@@ -15,6 +15,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 const GO_SOURCE: &str =
     "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n";
 const RUST_SOURCE: &str = "fn main() {\n    let s = String::new();\n    println!(\"{s}\");\n}\n";
+const TS_SOURCE: &str =
+    "const n = Math.max(1, 2);\nexport function twice(x: number): number {\n    return x * 2;\n}\n";
 const C_SOURCE: &str =
     "int add(int a, int b) { return a + b; }\n\nint main(void) { return add(1, 2); }\n";
 
@@ -382,5 +384,25 @@ async fn embedded_rust_analyzer() {
     // Line 1 is `    let s = String::new();`; character 14 is inside `String`.
     let hover = server.hover(&uri, 1, 14).await;
     assert!(hover.contains("String"), "{hover}");
+    server.finish().await;
+}
+
+/// Embedded TypeScript 7 language server: works with nothing on PATH, including the standard
+/// library declarations (`Math.max` comes from lib.es5.d.ts).
+#[tokio::test]
+async fn embedded_typescript() {
+    if !embedded_backends().iter().any(|b| b == "typescript") {
+        eprintln!("skipping: typescript is not embedded in this build");
+        return;
+    }
+    let empty = tempfile::tempdir().unwrap();
+    let env = [("PATH", empty.path().as_os_str())];
+    let files = [("main.ts", TS_SOURCE)];
+    let mut server = Server::start_with_env(&[], &files, &env).await;
+    assert_ne!(server.initialize().await["hoverProvider"], Value::Null);
+    let uri = server.open("main.ts", "typescript", TS_SOURCE).await;
+    // Line 0 is `const n = Math.max(1, 2);`; character 15 is inside `max`.
+    let hover = server.hover(&uri, 0, 15).await;
+    assert!(hover.contains("max"), "{hover}");
     server.finish().await;
 }

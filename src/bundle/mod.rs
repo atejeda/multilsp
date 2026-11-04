@@ -43,6 +43,19 @@ impl Installation {
         Some(self.root.join(&entry.program))
     }
 
+    /// Arguments to start a backend's executable with.
+    pub fn arguments(&self, backend: &str) -> Vec<OsString> {
+        let Some(entry) = self.manifest.backends.iter().find(|b| b.name == backend) else {
+            return Vec::new();
+        };
+        let dir = self.root.join(&entry.name);
+        entry
+            .args
+            .iter()
+            .map(|arg| OsString::from(arg.replace("{dir}", &dir.to_string_lossy())))
+            .collect()
+    }
+
     /// Environment a backend needs to find what was bundled with it, e.g. its own toolchain on
     /// PATH. PATH keeps the inherited entries after the bundled ones.
     pub fn environment(&self, backend: &str) -> Vec<(OsString, OsString)> {
@@ -474,6 +487,7 @@ mod tests {
                 source: "test".into(),
                 env: vec![("TOOL_HOME".into(), "{dir}/share".into())],
                 path: vec!["bin".into()],
+                args: vec!["--stdio".into(), "--config={dir}/etc".into()],
             }],
             files: Vec::new(),
         };
@@ -490,6 +504,8 @@ mod tests {
         let path = env[1].1.to_string_lossy().into_owned();
         assert!(path.starts_with("/opt/bundle/tool/bin"), "{path}");
         assert!(installation.environment("other").is_empty());
+        let args = installation.arguments("tool");
+        assert_eq!(args, ["--stdio", "--config=/opt/bundle/tool/etc"]);
     }
 
     #[test]

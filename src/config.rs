@@ -21,6 +21,7 @@ impl Default for Config {
                 BackendSpec::gopls(),
                 BackendSpec::clangd(),
                 BackendSpec::rust_analyzer(),
+                BackendSpec::typescript(),
             ],
         }
     }
@@ -41,7 +42,7 @@ impl Config {
             ) {
                 spec.launch = Launch::Command {
                     program,
-                    args: Vec::new(),
+                    args: installation.arguments(&backend.name),
                     env: installation.environment(&backend.name),
                 };
             }
@@ -82,11 +83,41 @@ impl BackendSpec {
         }
     }
 
+    /// The built-in definition of a backend, by name.
+    pub fn defaults(name: &str) -> Option<Self> {
+        Config::default()
+            .backends
+            .into_iter()
+            .find(|b| b.name == name)
+    }
+
     pub fn rust_analyzer() -> Self {
         Self {
             language_ids: strings(&["rust"]),
             extensions: strings(&["rs"]),
             ..Self::new("rust-analyzer", Launch::command("rust-analyzer"))
+        }
+    }
+
+    /// The language server built into TypeScript 7 (`tsc --lsp --stdio`), for TypeScript and
+    /// JavaScript.
+    pub fn typescript() -> Self {
+        Self {
+            language_ids: strings(&[
+                "typescript",
+                "typescriptreact",
+                "javascript",
+                "javascriptreact",
+            ]),
+            extensions: strings(&["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"]),
+            ..Self::new(
+                "typescript",
+                Launch::Command {
+                    program: "tsc".into(),
+                    args: vec!["--lsp".into(), "--stdio".into()],
+                    env: Vec::new(),
+                },
+            )
         }
     }
 
