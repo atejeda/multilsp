@@ -17,7 +17,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            backends: vec![BackendSpec::gopls(), BackendSpec::clangd()],
+            backends: vec![
+                BackendSpec::gopls(),
+                BackendSpec::clangd(),
+                BackendSpec::rust_analyzer(),
+            ],
         }
     }
 }
@@ -35,7 +39,11 @@ impl Config {
                 self.backend_mut(&backend.name),
                 installation.program(&backend.name),
             ) {
-                spec.set_program(program);
+                spec.launch = Launch::Command {
+                    program,
+                    args: Vec::new(),
+                    env: installation.environment(&backend.name),
+                };
             }
         }
     }
@@ -71,6 +79,14 @@ impl BackendSpec {
             extensions: strings(&["go"]),
             file_names: strings(&["go.mod", "go.work"]),
             ..Self::new("gopls", Launch::command("gopls"))
+        }
+    }
+
+    pub fn rust_analyzer() -> Self {
+        Self {
+            language_ids: strings(&["rust"]),
+            extensions: strings(&["rs"]),
+            ..Self::new("rust-analyzer", Launch::command("rust-analyzer"))
         }
     }
 

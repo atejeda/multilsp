@@ -72,7 +72,7 @@ fn build_bundle() -> Result<()> {
     let platform = platform(&target);
     let mut backends = Vec::new();
     for tech in subdirectories(&embed)? {
-        let variable = format!("MULTILSP_EMBED_{}", tech.to_uppercase());
+        let variable = format!("MULTILSP_EMBED_{}", tech.to_uppercase().replace('-', "_"));
         println!("cargo::rerun-if-env-changed={variable}");
         println!("cargo::rerun-if-env-changed={variable}_VERSION");
         let dest = tree.join(&tech);
@@ -98,6 +98,8 @@ fn build_bundle() -> Result<()> {
                 program: format!("{tech}/{program}"),
                 license,
                 source: path.display().to_string(),
+                env: Vec::new(),
+                path: Vec::new(),
             });
             continue;
         }
@@ -133,6 +135,14 @@ fn build_bundle() -> Result<()> {
                 .unwrap_or(&dir)
                 .display()
                 .to_string(),
+            env: headers(&dir.join("build.sh"), "env")
+                .into_iter()
+                .map(|line| match line.split_once('=') {
+                    Some((key, value)) => Ok((key.trim().to_string(), value.trim().to_string())),
+                    None => Err(format!("{}: `# env:` needs KEY=VALUE", dir.display())),
+                })
+                .collect::<Result<_>>()?,
+            path: headers(&dir.join("build.sh"), "path"),
         });
     }
     if target.contains("apple") {
@@ -252,14 +262,22 @@ fn prepare(leaf: &Path, target: &str, platform: &str, cache: &Path) -> Result<Pa
     Ok(binaries)
 }
 
-/// The value of a `# key: value` comment line in a script's header.
+/// The value of the first `# key: value` comment line in a script's header.
 fn header(script: &Path, key: &str) -> Option<String> {
-    let text = fs::read_to_string(script).ok()?;
+    headers(script, key).into_iter().next()
+}
+
+/// The values of every `# key: value` comment line in a script's header.
+fn headers(script: &Path, key: &str) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(script) else {
+        return Vec::new();
+    };
     let prefix = format!("# {key}:");
     text.lines()
         .take_while(|line| line.starts_with('#') || line.trim().is_empty())
-        .find_map(|line| line.strip_prefix(&prefix))
+        .filter_map(|line| line.strip_prefix(&prefix))
         .map(|value| value.trim().to_string())
+        .collect()
 }
 
 /// Copies a user-supplied executable into the bundle and returns its file name. Refuses anything

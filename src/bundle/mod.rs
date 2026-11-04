@@ -8,6 +8,7 @@
 
 mod format;
 
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,35 @@ impl Installation {
     pub fn program(&self, backend: &str) -> Option<PathBuf> {
         let entry = self.manifest.backends.iter().find(|b| b.name == backend)?;
         Some(self.root.join(&entry.program))
+    }
+
+    /// Environment a backend needs to find what was bundled with it, e.g. its own toolchain on
+    /// PATH. PATH keeps the inherited entries after the bundled ones.
+    pub fn environment(&self, backend: &str) -> Vec<(OsString, OsString)> {
+        let Some(entry) = self.manifest.backends.iter().find(|b| b.name == backend) else {
+            return Vec::new();
+        };
+        let dir = self.root.join(&entry.name);
+        let mut env: Vec<(OsString, OsString)> = entry
+            .env
+            .iter()
+            .map(|(key, value)| {
+                let value = value.replace("{dir}", &dir.to_string_lossy());
+                (OsString::from(key), OsString::from(value))
+            })
+            .collect();
+        if !entry.path.is_empty() {
+            let inherited = std::env::var_os("PATH").unwrap_or_default();
+            let dirs = entry
+                .path
+                .iter()
+                .map(|p| dir.join(p))
+                .chain(std::env::split_paths(&inherited));
+            if let Ok(path) = std::env::join_paths(dirs) {
+                env.push(("PATH".into(), path));
+            }
+        }
+        env
     }
 }
 
@@ -430,6 +460,36 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(leftovers, [bundle.id().to_string()]);
+    }
+
+    #[test]
+    fn resolves_backend_environment() {
+        let manifest = Manifest {
+            target: "test".into(),
+            backends: vec![BackendEntry {
+                name: "tool".into(),
+                version: "1".into(),
+                program: "tool/bin/tool".into(),
+                license: "MIT".into(),
+                source: "test".into(),
+                env: vec![("TOOL_HOME".into(), "{dir}/share".into())],
+                path: vec!["bin".into()],
+            }],
+            files: Vec::new(),
+        };
+        let installation = Installation {
+            root: PathBuf::from("/opt/bundle"),
+            manifest,
+        };
+        let env = installation.environment("tool");
+        assert_eq!(
+            env[0],
+            ("TOOL_HOME".into(), "/opt/bundle/tool/share".into())
+        );
+        assert_eq!(env[1].0, "PATH");
+        let path = env[1].1.to_string_lossy().into_owned();
+        assert!(path.starts_with("/opt/bundle/tool/bin"), "{path}");
+        assert!(installation.environment("other").is_empty());
     }
 
     #[test]

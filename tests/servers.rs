@@ -14,6 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 
 const GO_SOURCE: &str =
     "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n";
+const RUST_SOURCE: &str = "fn main() {\n    let s = String::new();\n    println!(\"{s}\");\n}\n";
 const C_SOURCE: &str =
     "int add(int a, int b) { return a + b; }\n\nint main(void) { return add(1, 2); }\n";
 
@@ -71,7 +72,9 @@ impl Server {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         for (name, contents) in files {
-            std::fs::write(root.join(name), contents).unwrap();
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
         }
         let root_uri = format!("file://{}", root.display());
 
@@ -113,6 +116,8 @@ impl Server {
                     "requests": {"full": {"delta": true}},
                     "tokenTypes": [], "tokenModifiers": [], "formats": ["relative"],
                 }},
+                // rust-analyzer reports when it has finished loading the workspace.
+                "experimental": {"serverStatusNotification": true},
             },
         });
         let id = self.client.request("initialize", params).await;
@@ -348,4 +353,45 @@ async fn embedded_gopls() {
     assert!(hover.contains("Println"), "{hover}");
     server.finish().await;
     assert!(install_location().join("gopls/gopls").is_file());
+}
+
+/// Embedded rust-analyzer with its bundled toolchain: with nothing on PATH, hovering a standard
+/// library type needs the bundled cargo and rustc (to load the project) and rust-src.
+#[tokio::test]
+async fn embedded_rust_analyzer() {
+    if !embedded_backends().iter().any(|b| b == "rust-analyzer") {
+        eprintln!("skipping: rust-analyzer is not embedded in this build");
+        return;
+    }
+    let empty = tempfile::tempdir().unwrap();
+    let cargo_home = tempfile::tempdir().unwrap();
+    let env = [
+        ("PATH", empty.path().as_os_str()),
+        ("CARGO_HOME", cargo_home.path().as_os_str()),
+    ];
+    let files = [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"hello\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+        ("src/main.rs", RUST_SOURCE),
+    ];
+    let mut server = Server::start_with_env(&[], &files, &env).await;
+    assert_ne!(server.initialize().await["hoverProvider"], Value::Null);
+    let uri = server.open("src/main.rs", "rust", RUST_SOURCE).await;
+    loop {
+        let status = server
+            .client
+            .notification("experimental/serverStatus")
+            .await;
+        let params = status.params.unwrap();
+        assert_ne!(params["health"], "error", "{params}");
+        if params["quiescent"] == true {
+            break;
+        }
+    }
+    // Line 1 is `    let s = String::new();`; character 14 is inside `String`.
+    let hover = server.hover(&uri, 1, 14).await;
+    assert!(hover.contains("String"), "{hover}");
+    server.finish().await;
 }

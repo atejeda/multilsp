@@ -6,22 +6,27 @@ starts the real language servers and routes each document to the one that handle
 
 ## Status
 
-Two backends: **clangd** (C, C++, Objective-C, CUDA) and **gopls** (Go). Both are embedded in
-the binary for every platform that has a leaf under [embed/](embed/README.md):
+Three backends, embedded in the binary for every platform that has a leaf under
+[embed/](embed/README.md):
 
-| Platform       | clangd | gopls |
-|----------------|--------|-------|
-| macOS arm64    | yes    | yes   |
-| macOS x86_64   | yes    | yes   |
-| Linux x86_64   | yes    | yes   |
-| Linux arm64    | -      | yes   |
+| Platform       | clangd (C, C++, Obj-C, CUDA) | gopls (Go) | rust-analyzer (Rust) |
+|----------------|------------------------------|------------|----------------------|
+| macOS arm64    | yes                          | yes        | yes                  |
+| macOS x86_64   | yes                          | yes        | yes                  |
+| Linux x86_64   | yes                          | yes        | yes                  |
+| Linux arm64    | -                            | yes        | yes                  |
 
-A backend that is not embedded runs from PATH. gopls still needs the Go toolchain (`go`) on
-PATH at runtime to load packages.
+A backend that is not embedded runs from PATH.
+
+rust-analyzer comes with its own Rust toolchain (cargo, rustc, rust-std, rust-src), so it works
+with nothing installed. gopls still needs the Go toolchain (`go`) on PATH at runtime. The full
+bundle is large: about 150 MB compressed in the binary and 700 MB installed on macOS arm64.
 
 ## Build
 
-Requires Rust 1.89 or newer, bash, `curl` and `unzip`, plus Go to produce the embedded gopls.
+Requires Rust 1.89 or newer, bash, `curl`, `tar` and `unzip`, plus Go to produce the embedded
+gopls. The first release build downloads about 330 MB and takes several minutes; later builds
+reuse each leaf's `binaries/`.
 
 ```sh
 cargo build --release
@@ -81,8 +86,8 @@ Neovim (0.11+):
 ```lua
 vim.lsp.config('multilsp', {
   cmd = { 'multilsp', 'serve', '--stdio' },
-  filetypes = { 'go', 'gomod', 'gowork', 'gotmpl', 'c', 'cpp', 'objc', 'objcpp', 'cuda' },
-  root_markers = { 'go.work', 'go.mod', 'compile_commands.json', '.git' },
+  filetypes = { 'go', 'gomod', 'gowork', 'gotmpl', 'c', 'cpp', 'objc', 'objcpp', 'cuda', 'rust' },
+  root_markers = { 'go.work', 'go.mod', 'Cargo.toml', 'compile_commands.json', '.git' },
 })
 vim.lsp.enable('multilsp')
 ```
@@ -105,6 +110,10 @@ language-servers = ["multilsp"]
 [[language]]
 name = "cpp"
 language-servers = ["multilsp"]
+
+[[language]]
+name = "rust"
+language-servers = ["multilsp"]
 ```
 
 ## Tests
@@ -116,9 +125,9 @@ cargo test
 The gateway tests use in-process fake backends and need nothing installed. `tests/servers.rs`
 runs the real binary against gopls and clangd, found through `MULTILSP_GOPLS` /
 `MULTILSP_CLANGD`, then `PATH`, `$GOPATH/bin` and `~/go/bin`; each test is skipped when its
-servers are missing (run with `-- --nocapture` to see skips). `embedded_clangd` and
-`embedded_gopls` run whichever servers the build embedded, with nothing else on PATH (gopls
-gets only `go`), and exercise `bundle verify`/`repair`; tests install into `target/tmp/data`,
+servers are missing (run with `-- --nocapture` to see skips). `embedded_clangd`,
+`embedded_gopls` and `embedded_rust_analyzer` run whichever servers the build embedded, with
+nothing else on PATH (gopls gets only `go`), and exercise `bundle verify`/`repair`; tests install into `target/tmp/data`,
 not your data directory.
 
 Install gopls with `go install golang.org/x/tools/gopls@latest`; clangd comes with LLVM

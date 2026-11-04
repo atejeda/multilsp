@@ -29,6 +29,13 @@ pub struct BackendEntry {
     pub license: String,
     /// Where the build obtained it.
     pub source: String,
+    /// Environment for the backend's process. `{dir}` in a value stands for the backend's
+    /// installed directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(String, String)>,
+    /// Directories, relative to the backend's installed directory, put first on its PATH.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

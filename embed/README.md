@@ -31,11 +31,17 @@ Delete `binaries/` to run the script again. `binaries/` is not committed.
 The script's header declares what it produces:
 
 ```bash
-# license: BSD-3-Clause      SPDX expression, shown by `multilsp bundle info`
-# program: gopls             the executable, relative to binaries/
+# license: MIT OR Apache-2.0                 SPDX expression, shown by `multilsp bundle info`
+# program: toolchain/bin/rust-analyzer       the executable, relative to binaries/
+# path: toolchain/bin                        put first on the server's PATH (repeatable)
+# env: CARGO={dir}/toolchain/bin/cargo       set for the server's process (repeatable)
 ```
 
-Without `# program:`, `<tech>` or `bin/<tech>` is used.
+Without `# program:`, `<tech>` or `bin/<tech>` is used. In `# env:` values, `{dir}` is where
+`binaries/` ends up installed. A leaf should carry everything its server needs at runtime (for
+rust-analyzer: cargo, rustc, rust-std and rust-src), even if that repeats files across
+technologies and versions; `# path:` and `# env:` make the server use them instead of whatever
+the user has installed.
 
 Each `build.sh` is self-contained: it has everything it needs to produce its files, with no
 shared helpers.

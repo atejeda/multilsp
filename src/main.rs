@@ -86,7 +86,8 @@ fn serve(args: ServeArgs) -> ! {
             );
             std::process::exit(2);
         };
-        spec.set_program(path);
+        // A user-chosen server runs with the user's environment, not the bundled one.
+        spec.launch = multilsp::Launch::command(path);
     }
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to start the async runtime");
@@ -131,7 +132,7 @@ fn bundle(command: BundleCommand) -> i32 {
             println!("location  {}", bundle.install_dir(&dir).display());
             for backend in &manifest.backends {
                 println!(
-                    "{:<9} {} [{}] {}",
+                    "{:<14} {} [{}] {}",
                     backend.name, backend.version, backend.license, backend.source
                 );
             }
